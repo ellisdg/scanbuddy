@@ -10,6 +10,7 @@ from pubsub import pub
 from pathlib import Path
 from sortedcontainers import SortedDict
 from scanbuddy.proc.converter import Converter
+from scanbuddy.common.dicom import get_tag
 
 logger = logging.getLogger(__name__)
 
@@ -57,9 +58,8 @@ class VnavProcessor:
         scandesc = ds.get('SeriesDescription', '[SERIES]')
         scannum = ds.get('SeriesNumber', '[NUMBER]')
         subtitle_string = f'{project} • {session} • {scandesc} • {scannum}'
-        try:
-            num_vols = ds[(0x0020, 0x0105)].value
-        except KeyError:
+        num_vols = get_tag(ds, (0x0020, 0x0105))
+        if num_vols is None:
             logger.info('Could not determine total number of volumes')
             num_vols = 5000
         if self._debug_display:
@@ -130,4 +130,3 @@ class VnavProcessor:
                     count += 1          
             new_nii = nib.Nifti1Image(unmosaic, aff, hdr)
             nib.save(new_nii, file)
-

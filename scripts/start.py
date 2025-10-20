@@ -12,10 +12,9 @@ from scanbuddy.proc import Processor
 from scanbuddy.view.dash import View
 from scanbuddy.proc.volreg import VolReg
 from scanbuddy.proc.params import Params
-from scanbuddy.proc.fdata import ExtractFdata
 from scanbuddy.broker.redis import MessageBroker
 from scanbuddy.common import print_platform_info
-from scanbuddy.watcher.directory import DirectoryWatcher,DirectoryWatcherError
+from scanbuddy.watcher.directory import DirectoryWatcher
 
 logger = logging.getLogger('main')
 logging.basicConfig(level=logging.INFO)
@@ -32,6 +31,7 @@ def main():
     parser.add_argument('--folder', type=Path, required=True)
     parser.add_argument('--snr-interval', default=10, 
         help='Every N volumes snr should be calculated')
+    parser.add_argument('--no-snr', action='store_true', help='Disable SNR calculation and plotting')
     parser.add_argument('-v', '--verbose', action='store_true')
     args = parser.parse_args()
 
@@ -48,6 +48,8 @@ def main():
         config.update_or_create('$.broker.host', args.broker_host)
     if args.broker_port:
         config.update_or_create('$.broker.port', args.broker_port)
+    if args.no_snr:
+        config.update_or_create('$.app.snr.enabled', False)
 
     broker = MessageBroker(
         config=config,
@@ -62,7 +64,13 @@ def main():
         debug=args.verbose
     )
     volreg = VolReg(mock=args.mock)
-    snr = SNR()
+    # Instantiate SNR only if enabled
+    snr_enabled = config.find_one('$.app.snr.enabled', default=True)
+    if snr_enabled:
+        snr = SNR()
+        logger.info('SNR processor enabled')
+    else:
+        logger.info('SNR processor disabled by configuration')
     view = View(
         broker=broker,
         config=config,

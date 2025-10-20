@@ -13,13 +13,27 @@ from pubsub import pub
 import collections as c
 from pathlib import Path
 from sortedcontainers import SortedDict
+from scanbuddy.common.dicom import get_receive_coil_name, get_tag, get_num_vols
 
 logger = logging.getLogger(__name__)
+
+class MaskThresholdError(Exception):
+    pass
 
 class SNR:
     def __init__(self):
         pub.subscribe(self.listener, 'snr')
         self._debug_display = True
+        # Initialize attributes used later in run()
+        self._fdata_array = None
+        self._slice_intensity_means = None
+        self._snr_instances = SortedDict()
+        self._num_vols = None
+        self._z = None
+        self._mask_threshold = None
+        self._decrement = None
+        # capacity of 4th dim when num_vols is unknown
+        self._capacity = 0
 
     def listener(self, key, snr_instances, ds):
         logger.info('received tasks for snr calculation')
@@ -31,43 +45,75 @@ class SNR:
         self._snr_instances = snr_instances
         self.run(key, ds)
 
+    def _ensure_capacity(self, required_volumes):
+        """
+        Ensure self._fdata_array and self._slice_intensity_means have capacity
+        for at least `required_volumes` timepoints.
+        """
+        if self._fdata_array is None:
+            return
+        current_cap = self._fdata_array.shape[3]
+        if required_volumes <= current_cap:
+            return
+        # grow capacity (double strategy)
+        new_cap = max(required_volumes, max(64, current_cap * 2))
+        x, y, z, _ = self._fdata_array.shape
+        new_fdata = np.zeros((x, y, z, new_cap), dtype=self._fdata_array.dtype)
+        new_fdata[..., :current_cap] = self._fdata_array
+        self._fdata_array = new_fdata
+        if self._slice_intensity_means is not None:
+            _, cur_cap_means = self._slice_intensity_means.shape
+            if new_cap > cur_cap_means:
+                new_means = np.zeros((self._slice_intensity_means.shape[0], new_cap), dtype=self._slice_intensity_means.dtype)
+                new_means[:, :cur_cap_means] = self._slice_intensity_means
+                self._slice_intensity_means = new_means
+        self._capacity = new_cap
+        logger.debug(f'Expanded SNR buffers to capacity {new_cap}')
+
     def run(self, key, ds):
 
         start = time.time()
 
         if key < 5:
-            self._num_vols = ds[(0x0020, 0x0105)].value
+            # number of volumes may be unknown; use safe helper
+            self._num_vols = get_num_vols(ds, default=None)
             self._mask_threshold, self._decrement = self.get_mask_threshold(ds)
             x, y, self._z, _ = self._snr_instances[key]['fdata_array'].shape
-            self._fdata_array = np.zeros((x, y, self._z, self._num_vols), dtype=np.float64)
-            self._slice_intensity_means = np.zeros((self._z, self._num_vols), dtype=np.float64)
+            # Defer allocation until we start inserting volumes (key >= 5)
+            logger.info(f'initial shapes — input fdata: {self._snr_instances[key]["fdata_array"].shape}, num_vols: {self._num_vols}')
 
-            logger.info(f'shape of zeros: {self._fdata_array.shape}')
-            logger.info(f"shape of fdata array: {self._snr_instances[key]['fdata_array'].shape}")
-        
         if key >= 5:
             # double check that necessary objects exist before calculating SNR
             if self._fdata_array is None:
-                self._num_vols = ds[(0x0020, 0x0105)].value
+                # try to resolve number of volumes, but it may be unknown
+                self._num_vols = get_num_vols(ds, default=None)
                 self._mask_threshold, self._decrement = self.get_mask_threshold(ds)
                 x, y, self._z, _ = self._snr_instances[key]['fdata_array'].shape
-                self._fdata_array = np.zeros((x, y, self._z, self._num_vols), dtype=np.float64)
-                self._slice_intensity_means = np.zeros((self._z, self._num_vols), dtype=np.float64)
+                insert_position = key - 5
+                # choose initial capacity
+                init_cap = self._num_vols if self._num_vols else max(64, insert_position + 1)
+                self._fdata_array = np.zeros((x, y, self._z, init_cap), dtype=np.float64)
+                self._slice_intensity_means = np.zeros((self._z, init_cap), dtype=np.float64)
+                self._capacity = init_cap
+                logger.info(f'initialized SNR buffers with capacity: {init_cap}, shape: {self._fdata_array.shape}')
 
             insert_position = key - 5
+            # ensure capacity for this insert
+            self._ensure_capacity(insert_position + 1)
             self._fdata_array[:, :, :, insert_position] = self._snr_instances[key]['fdata_array'].squeeze()
             self._snr_instances[key]['fdata_array'] = np.array([])
             logger.info(f'Current RAM usage: {round(psutil.virtual_memory().used / (1024 ** 3), 3)} GB')
 
         
-        if key > 53 and (key % 4 == 0) and key < self._num_vols:
+        # When num_vols unknown, still compute SNR periodically
+        if key > 53 and (key % 4 == 0) and (self._num_vols is None or key < self._num_vols):
             logger.info('launching calculate and publish snr thread')
 
             #snr_thread = threading.Thread(target=self.calculate_and_publish_snr, args=(key,))
             #snr_thread.start()
             self.calculate_and_publish_snr(key)
 
-        if key == self._num_vols:
+        if self._num_vols is not None and key == self._num_vols:
             time.sleep(2)
             data_path = os.path.dirname(self._snr_instances[key]['path'])
             logger.info(f'removing dicom dir: {data_path}')
@@ -99,12 +145,14 @@ class SNR:
             logger.info(f'snr is a nan, decrementing mask threshold by {self._decrement}')
             self._mask_threshold = self._mask_threshold - self._decrement
             logger.info(f'new threshold: {self._mask_threshold}')
-            self._slice_intensity_means = np.zeros( (self._z, self._num_vols) )
+            # reinitialize means without relying on num_vols
+            if self._slice_intensity_means is not None:
+                self._slice_intensity_means = np.zeros_like(self._slice_intensity_means)
         else:
             if self._debug_display:
                 pub.sendMessage('plot_snr', snr_metric=snr_metric) 
-            elif key >= (self._num_vols - 6):
-                pub.sendMessage('plot_snr', snr_metric=snr_metric) 
+            elif self._num_vols is not None and key >= (self._num_vols - 6):
+                pub.sendMessage('plot_snr', snr_metric=snr_metric)
 
     def calc_snr(self, key):
         slice_intensity_means, slice_voxel_counts, data = self.get_mean_slice_intensities(key)
@@ -279,9 +327,7 @@ class SNR:
         raise MaskThresholdError(f'unexpected bits stored "{bits_stored}" + receive coil "{receive_coil}"')
 
     def find_coil(self, ds):
-        seq = ds[(0x5200, 0x9229)][0]
-        seq = seq[(0x0018, 0x9042)][0]
-        return seq[(0x0018, 0x1250)].value
+        return get_receive_coil_name(ds)
 
     def get_new_key(self, instance_number):
         return ((instance_number - 2) // 4) + 1
@@ -294,7 +340,5 @@ class SNR:
         self._fdata_array = None
         self._slice_intensity_means = None
         self._snr_instances = SortedDict()
+        self._capacity = 0
         logger.info(f'Final RAM usage: {round(psutil.virtual_memory().used / (1024 ** 3), 3)} GB')
-
-
-
