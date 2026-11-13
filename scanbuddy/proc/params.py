@@ -1,6 +1,11 @@
 import os
 import logging
 from pubsub import pub
+from scanbuddy.common.dicom import (
+    get_receive_coil_name,
+    get_table_position_value,
+    get_coil_elements_value,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -83,17 +88,12 @@ class Params:
                 break
 
     def find_table_position(self, ds):
-        seq = ds[(0x5200, 0x9230)][0]
-        seq = seq[(0x0021, 0x11fe)][0]
-        return seq[(0x0021, 0x1145)].value[-1]
+        # Preserve existing behavior of returning the last character of the value
+        val = get_table_position_value(ds)
+        return val[-1] if isinstance(val, str) and val else None
 
     def findcoil(self, ds):
-        seq = ds[(0x5200, 0x9229)][0]
-        seq = seq[(0x0018, 0x9042)][0]
-        return seq[(0x0018, 0x1250)].value
-   
-    def findcoilelements(self, ds):
-        seq = ds[(0x5200, 0x9230)][0]
-        seq = seq[(0x0021, 0x11fe)][0]
-        return seq[(0x0021, 0x114f)].value
+        return get_receive_coil_name(ds)
 
+    def findcoilelements(self, ds):
+        return get_coil_elements_value(ds)

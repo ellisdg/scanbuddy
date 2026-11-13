@@ -12,10 +12,11 @@ import threading
 import numpy as np
 from pubsub import pub
 from pathlib import Path
-from scanbuddy.proc.snr import SNR
 from sortedcontainers import SortedDict
 from scanbuddy.proc.fdata import ExtractFdata
 from scanbuddy.proc.converter import Converter
+from pydicom.tag import Tag
+from scanbuddy.common.dicom import get_tag, get_path
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,8 @@ class BoldProcessor:
         self.reset()
         self._config = config
         self._debug_display = self._config.find_one('$.app.debug_display', default=debug_display)
+        # New: read SNR enable flag from config (default True)
+        self._snr_enabled = self._config.find_one('$.app.snr.enabled', default=True)
         pub.subscribe(self.reset, 'reset')
         pub.subscribe(self.listener, 'bold-proc')
 
@@ -80,10 +83,10 @@ class BoldProcessor:
         subtitle_string = f'{project} • {session} • {scandesc} • {scannum}'
         if key < 6:
             logger.info(f'Scan info: Project: {project}, Session: {session}, Series: {scandesc}, Scan Number: {scannum}, Date & Time: {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')        
-        num_vols = ds[(0x0020, 0x0105)].value
+        num_vols = get_tag(ds, (0x0020, 0x0105))
         if self._debug_display:
             pub.sendMessage('plot', instances=self._instances, subtitle_string=subtitle_string)
-        elif num_vols == key:
+        elif num_vols and num_vols == key:
             pub.sendMessage('plot', instances=self._instances, subtitle_string=subtitle_string)
 
         fdata_tasks = self.check_fdata(key)
@@ -92,12 +95,16 @@ class BoldProcessor:
         nii_path = self._instances[key]['nii_path']
         fdata_extraction.do(nii_path, fdata_tasks)
 
-        snr_thread = threading.Thread(
-            target=pub.sendMessage,
-            args=('snr',),
-            kwargs={'key': key, 'snr_instances': self._snr_instances, 'ds': ds}
-        )
-        snr_thread.start()
+        # Only publish SNR tasks if enabled
+        if self._snr_enabled:
+            snr_thread = threading.Thread(
+                target=pub.sendMessage,
+                args=('snr',),
+                kwargs={'key': key, 'snr_instances': self._snr_instances, 'ds': ds}
+            )
+            snr_thread.start()
+        else:
+            logger.info('SNR disabled by configuration; skipping SNR task publish')
 
     def check_volreg(self, key):
         tasks = list()
@@ -147,31 +154,43 @@ class BoldProcessor:
         self._fdata_array = None
         self._slice_intensity_means = None
 
+
     def check_echo(self, ds):
-        '''
-        This method will check for the string 'TE' in 
-        the siemens private data tag. If 'TE' exists in that
-        tag it means the scan is multi-echo. If it is multi-echo
-        we are only interested in the second echo or 'TE2'
-        Return False if 'TE2' is not found. Return True if 
-        'TE2' is found or no reference to 'TE' is found
-        '''
-        sequence = ds[(0x5200, 0x9230)][0]
-        siemens_private_tag = sequence[(0x0021, 0x11fe)][0]
-        scan_string = str(siemens_private_tag[(0x0021, 0x1175)].value)
-        if 'TE2' in scan_string:
-            logger.info('multi-echo scan detected')
-            logger.info(f'using 2nd echo time: {self.get_echo_time(ds)}')
-            return True, True
-        elif 'TE' not in scan_string:
-            logger.info('single echo scan detected')
+        """
+        Safely check for multi-echo / TE2 information.
+        Returns (is_multi_echo, is_TE2).
+        """
+        seq_tag = Tag(0x5200, 0x9230)
+        # Safely get the data element; ds.get returns None if missing
+        elem = ds.get(seq_tag)
+        if elem is None:
             return False, False
+
+        # Extract sequence value if present
+        seq = getattr(elem, "value", elem)
+        if not seq:
+            return False, False
+
+        # Ensure we have at least one item
+        try:
+            first_item = seq[0]
+        except Exception:
+            return False, False
+
+        # Look for Echo Time tag in items to detect multi-echo
+        echo_time_tag = Tag(0x0018, 0x0081)  # (0018,0081) Echo Time
+        is_multi_echo = len(seq) > 1
+        is_TE2 = False
+        if echo_time_tag in first_item:
+            if is_multi_echo and echo_time_tag in seq[1]:
+                is_TE2 = True
         else:
-            logger.info('multi-echo scan found, wrong echo time, deleting file and moving on')
-            return True, False
+            # no echo time info — treat as single echo
+            is_multi_echo = False
+            is_TE2 = False
+
+        return is_multi_echo, is_TE2
 
     def get_echo_time(self, ds):
-        sequence = ds[(0x5200, 0x9230)][0]
-        echo_sequence_item = sequence[(0x0018, 0x9114)][0]
-        return echo_sequence_item[(0x0018, 0x9082)].value
-
+        # Per-frame FG -> MR Timing and Related Parameters Sequence -> EchoTime
+        return get_path(ds, (0x5200, 0x9230), 0, (0x0018, 0x9114), 0, (0x0018, 0x0081))
